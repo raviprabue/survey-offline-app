@@ -1,0 +1,15 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Survey data
+    match /survey_data/{surveyId} {
+
+      allow create: if true;
+      allow read: if true;
+
+    }
+
+  }
+}

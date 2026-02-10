@@ -1,0 +1,819 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Survey Intelligence Map</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+
+  <!-- Marker Cluster -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster/dist/MarkerCluster.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster/dist/MarkerCluster.Default.css">
+
+  <!-- Draw Tool -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw/dist/leaflet.draw.css"/>
+
+  <style>
+    body { margin:0; font-family:Arial; }
+
+    #topbar {
+      padding:10px;
+      background:#f2f2f2;
+      display:flex;
+      gap:8px;
+      align-items:center;
+      flex-wrap:wrap;
+    }
+
+    #map {
+      height: calc(100vh - 60px);
+    }
+
+    select, button, input {
+      padding:6px;
+    }
+
+  </style>
+</head>
+
+<body>
+
+<div id="topbar">
+
+<button onclick="window.location.href='dashboard.html'">DASHBOARD</button>
+<button id="refreshBtn" onclick="forceRefreshCache(db)">Refresh Data</button>
+
+
+  <input type="date" id="fromDate">
+  <input type="date" id="toDate">
+  <button onclick="applyDateFilter()">Apply Date</button>
+
+  <select id="surveyorSelect"></select>
+  <button onclick="applySurveyorFilter()">Apply Surveyor</button>
+
+  <select id="questionSelect"></select>
+  <select id="valueSelect"></select>
+
+  <button onclick="addFilter()">Add Layer</button>
+
+  <button onclick="toggleHeatmap()">Heatmap</button>
+  <button onclick="clearMap()">Clear</button>
+
+</div>
+
+<div id="map"></div>
+
+<!-- LEGEND PANEL -->
+<div id="legendBox" style="
+position:fixed;
+top:70px;
+right:10px;
+background:white;
+padding:10px;
+border-radius:8px;
+box-shadow:0 0 8px rgba(0,0,0,0.3);
+max-width:280px;
+font-size:13px;
+z-index:1000;
+">
+
+<b>Active Layers</b>
+<div id="legendList"></div>
+
+</div>
+
+<!-- PHOTO MODAL -->
+<div id="photoModal" style="
+display:none;
+position:fixed;
+top:0;
+left:0;
+width:100%;
+height:100%;
+background:rgba(0,0,0,0.85);
+justify-content:center;
+align-items:center;
+z-index:9999;
+flex-direction:column;
+">
+
+  <span onclick="closePhotoModal()" style="
+  position:absolute;
+  top:20px;
+  right:30px;
+  font-size:30px;
+  color:white;
+  cursor:pointer;">✖</span>
+
+  <img id="photoViewer" style="
+  max-width:90%;
+  max-height:80%;
+  border-radius:8px;
+  border:4px solid white;
+  ">
+
+  <div style="margin-top:10px;">
+    <button onclick="prevPhoto()">⬅ Prev</button>
+    <button onclick="nextPhoto()">Next ➡</button>
+  </div>
+
+</div>
+
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.markercluster/dist/leaflet.markercluster.js"></script>
+<script src="https://unpkg.com/leaflet-draw/dist/leaflet.draw.js"></script>
+<script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
+
+<script type="module">
+
+// ================= HYBRID CACHE ENGINE =================
+const LAST_SYNC_KEY = "last_firestore_sync_time";
+const DAILY_REFRESH_KEY = "last_manual_refresh_date";
+
+const DB_NAME = "SurveyCacheDB";
+const STORE_NAME = "survey_data_store";
+
+const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+let memoryCache = null;
+
+
+
+
+
+function checkDailyRefreshLock() {
+
+  const today = new Date().toISOString().slice(0,10);
+  const lastRefresh = localStorage.getItem(DAILY_REFRESH_KEY);
+
+  const btn = document.getElementById("refreshBtn");
+
+  if (!btn) return;
+
+  if (lastRefresh === today) {
+
+    btn.disabled = true;
+    btn.innerText = "Refreshed Today";
+
+    btn.style.background = "#ccc";
+    btn.style.cursor = "not-allowed";
+
+  }
+
+}
+
+
+
+
+
+
+
+
+
+// ---------- IndexedDB Init ----------
+
+function openCacheDB() {
+
+  return new Promise((resolve, reject) => {
+
+    const request = indexedDB.open(DB_NAME, 1);
+
+    request.onupgradeneeded = (event) => {
+
+      const db = event.target.result;
+
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME);
+      }
+
+    };
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject("IndexedDB open failed");
+
+  });
+
+}
+
+// ---------- Save Cache ----------
+
+// ---------- Load Cache ----------
+
+
+
+
+
+
+async function saveMonthlyPartition(data) {
+
+  const db = await openCacheDB();
+  const tx = db.transaction(STORE_NAME, "readwrite");
+  const store = tx.objectStore(STORE_NAME);
+
+  const grouped = {};
+
+  data.forEach(item => {
+
+    if (!item.date) return;
+
+    const monthKey = item.date.substring(0, 7); // YYYY-MM
+
+    if (!grouped[monthKey]) grouped[monthKey] = [];
+
+    grouped[monthKey].push(item);
+
+  });
+
+  for (const month in grouped) {
+
+    const existingReq = store.get(month);
+
+    existingReq.onsuccess = () => {
+
+      const existing = existingReq.result || [];
+
+      store.put(grouped[month], month);
+
+
+    };
+
+  }
+
+}
+
+
+
+
+async function loadAllMonths() {
+
+  const db = await openCacheDB();
+  const tx = db.transaction(STORE_NAME, "readonly");
+  const store = tx.objectStore(STORE_NAME);
+
+  return new Promise(resolve => {
+
+    const all = [];
+    const cursor = store.openCursor();
+
+    cursor.onsuccess = e => {
+
+      const cur = e.target.result;
+
+      if (cur) {
+
+         {
+          all.push(...cur.value);
+        }
+
+        cur.continue();
+
+      } else {
+
+        resolve(all);
+
+      }
+    };
+
+  });
+}
+
+
+
+
+
+
+
+
+
+
+
+
+// ---------- Main Cached Loader ----------
+async function getSurveyDataHybrid(dbFirestore) {
+
+  // 1️⃣ MEMORY CACHE
+  if (memoryCache) {
+    console.log("Loaded from MEMORY");
+    return memoryCache;
+  }
+
+  // 2️⃣ LOAD INDEXEDDB CACHE (ALL MONTHS)
+  const cached = await loadAllMonths();
+
+  if (cached.length > 0) {
+
+    console.log("Loaded from INDEXEDDB");
+    memoryCache = cached;
+
+    // Background incremental sync (non blocking)
+    //incrementalSync(dbFirestore);//
+
+    return cached;
+  }
+
+  // 3️⃣ FIRST TIME FULL FETCH
+  console.log("First time Firestore fetch");
+
+  const snapshot = await getDocs(collection(dbFirestore, "survey_data"));
+
+  let freshData = [];
+
+  snapshot.forEach(doc => freshData.push(doc.data()));
+
+  memoryCache = freshData;
+
+  await saveMonthlyPartition(freshData);
+
+  localStorage.setItem(LAST_SYNC_KEY, Date.now());
+
+  return freshData;
+}
+
+async function incrementalSync(dbFirestore) {
+
+  const lastSync = localStorage.getItem(LAST_SYNC_KEY);
+
+  if (!lastSync) return;
+
+  console.log("Incremental Sync Started");
+
+  const q = query(
+    collection(dbFirestore, "survey_data"),
+    where("created_at", ">", new Date(parseInt(lastSync)))
+  );
+
+  const snapshot = await getDocs(q);
+
+  if (snapshot.empty) {
+    console.log("No new records");
+    return;
+  }
+
+  let newData = [];
+
+  snapshot.forEach(doc => newData.push(doc.data()));
+
+  console.log("New records:", newData.length);
+
+  // Merge into memory
+  const existingIds = new Set(memoryCache.map(x => x.survey_id));
+
+const uniqueNew = newData.filter(x => !existingIds.has(x.survey_id));
+
+memoryCache = memoryCache.concat(uniqueNew);
+
+
+  // Save to month partitions
+  await saveMonthlyPartition(newData);
+
+  // Update sync time
+  localStorage.setItem(LAST_SYNC_KEY, Date.now());
+}
+
+
+
+
+
+// ---------- Manual Refresh ----------
+window.forceRefreshCache = async (dbFirestore) => {
+
+  const today = new Date().toISOString().slice(0,10);
+
+  const lastRefresh = localStorage.getItem(DAILY_REFRESH_KEY);
+
+  // Block multiple refresh per day
+  if (lastRefresh === today) {
+
+    alert("Data already refreshed today. Try again tomorrow.");
+    return;
+
+  }
+
+  const ok = confirm("This will reload ALL data from Firebase. Continue?");
+  if (!ok) return;
+
+  // 🔒 IMMEDIATELY LOCK BUTTON
+  const btn = document.getElementById("refreshBtn");
+  if (btn) {
+    btn.disabled = true;
+    btn.innerText = "Refreshing...";
+    btn.style.background = "#ccc";
+  }
+
+  console.log("Daily refresh started");
+
+  // Save refresh date
+  localStorage.setItem(DAILY_REFRESH_KEY, today);
+
+  // Clear cache
+  indexedDB.deleteDatabase(DB_NAME);
+  localStorage.removeItem(LAST_SYNC_KEY);
+
+  memoryCache = null;
+
+  location.reload();
+};
+
+
+
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+import { 
+  getFirestore, 
+  collection, 
+  getDocs,
+  query,
+  where 
+} from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+
+// ---------------- FIREBASE ----------------
+
+const firebaseConfig = {
+  apiKey: "AIzaSyCZaG0u7xMETIJPSakZYLzLtdlpYJ8MRn4",
+  authDomain: "cgsurvey-sblr.firebaseapp.com",
+  projectId: "cgsurvey-sblr",
+  storageBucket: "cgsurvey-sblr.appspot.com"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+
+// ---------------- GLOBAL STATE ----------------
+
+const colors = ["green","red","blue","orange","purple","brown","black"];
+let colorIndex = 0;
+
+let activeFilters = [];
+let rawData = [];
+let markers = [];
+
+let activeFromDate = null;
+let activeToDate = null;
+let activeSurveyor = null;
+
+let heatLayer = null;
+let heatMode = false;
+
+let currentPhotos = [];
+let currentIndex = 0;
+
+let selectedPolygon = null;
+
+// ---------------- MAP INIT ----------------
+
+const map = L.map('map').setView([20.5937, 78.9629], 5);
+
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+
+// Cluster Group
+let clusterGroup = L.markerClusterGroup();
+map.addLayer(clusterGroup);
+
+// Draw Layer
+const drawnItems = new L.FeatureGroup();
+map.addLayer(drawnItems);
+
+const drawControl = new L.Control.Draw({
+  edit: { featureGroup: drawnItems },
+  draw: {
+    polygon:true,
+    rectangle:true,
+    circle:false,
+    polyline:false,
+    marker:false,
+    circlemarker:false
+  }
+});
+map.addControl(drawControl);
+
+// Capture Area Draw
+map.on(L.Draw.Event.CREATED, function (event) {
+  drawnItems.clearLayers();
+  drawnItems.addLayer(event.layer);
+  selectedPolygon = event.layer;
+  applyMultiFilter();
+});
+
+// ---------------- LOAD DATA ----------------
+
+async function loadMapData() {
+
+  rawData = await getSurveyDataHybrid(db);
+
+  buildQuestionDropdown();
+  buildSurveyorDropdown();
+}
+
+loadMapData();
+checkDailyRefreshLock();
+
+
+// ---------------- DROPDOWNS ----------------
+
+function buildQuestionDropdown() {
+
+  const set = new Set();
+
+  rawData.forEach(r => {
+    if (r.answers) {
+      Object.values(r.answers).forEach(q => set.add(q.question));
+    }
+  });
+
+  const qs = document.getElementById("questionSelect");
+  qs.innerHTML = `<option value="">Select Question</option>`;
+
+  [...set].forEach(q => qs.innerHTML += `<option value="${q}">${q}</option>`);
+}
+
+function buildSurveyorDropdown() {
+
+  const set = new Set();
+
+  rawData.forEach(r => {
+    if (r.surveyor_id) set.add(r.surveyor_id);
+  });
+
+  const s = document.getElementById("surveyorSelect");
+  s.innerHTML = `<option value="">All Surveyors</option>`;
+
+  [...set].forEach(id => s.innerHTML += `<option value="${id}">${id}</option>`);
+}
+
+// Load values dynamically
+document.getElementById("questionSelect").addEventListener("change", () => {
+
+  const q = document.getElementById("questionSelect").value;
+  const vSelect = document.getElementById("valueSelect");
+
+  vSelect.innerHTML = `<option value="">Select Value</option>`;
+
+  const set = new Set();
+
+  rawData.forEach(r => {
+    if (r.answers) {
+      Object.values(r.answers).forEach(a => {
+        if (a.question === q) set.add(a.value);
+      });
+    }
+  });
+
+  [...set].forEach(v => vSelect.innerHTML += `<option value="${v}">${v}</option>`);
+
+  vSelect.focus();
+});
+
+// ---------------- FILTER CONTROLS ----------------
+
+window.addFilter = () => {
+
+  const q = questionSelect.value;
+  const v = valueSelect.value;
+
+  if (!q || !v) {
+    alert("Select question and value");
+    return;
+  }
+
+  activeFilters.push({
+    id: Date.now(),
+    question: q,
+    value: v,
+    color: colors[colorIndex++ % colors.length],
+    visible: true
+  });
+
+  questionSelect.value = "";
+  valueSelect.innerHTML = "";
+
+  applyMultiFilter();
+  updateLegend();
+};
+
+window.applyDateFilter = () => {
+
+  activeFromDate = fromDate.value ? new Date(fromDate.value) : null;
+  activeToDate = toDate.value ? new Date(toDate.value) : null;
+
+  applyMultiFilter();
+};
+
+window.applySurveyorFilter = () => {
+
+  activeSurveyor = surveyorSelect.value || null;
+  applyMultiFilter();
+};
+
+// ---------------- MAIN MAP ENGINE ----------------
+
+function applyMultiFilter() {
+
+  clusterGroup.clearLayers();
+  markers = [];
+
+  if (heatLayer) {
+    map.removeLayer(heatLayer);
+    heatLayer = null;
+  }
+
+  let heatPoints = [];
+
+  activeFilters.forEach(filter => {
+
+    if (!filter.visible) return;
+
+    const matched = rawData.filter(r => {
+
+      if (!r.answers) return false;
+
+      // Date Filter
+      if (activeFromDate || activeToDate) {
+
+        if (!r.date) return false;
+        const d = new Date(r.date);
+
+        if (activeFromDate && d < activeFromDate) return false;
+        if (activeToDate && d > activeToDate) return false;
+      }
+
+      // Surveyor Filter
+      if (activeSurveyor && r.surveyor_id !== activeSurveyor) return false;
+
+      // Area Filter
+      if (selectedPolygon) {
+
+        if (!r.gps) return false;
+
+        const p = L.latLng(r.gps.lat, r.gps.lng);
+        if (!selectedPolygon.getBounds().contains(p)) return false;
+      }
+
+      // Question Filter
+      return Object.values(r.answers).some(a =>
+        a.question === filter.question && a.value === filter.value
+      );
+    });
+
+    matched.forEach(d => {
+
+      if (!d.gps) return;
+
+      heatPoints.push([d.gps.lat, d.gps.lng, 1]);
+
+      if (!heatMode) {
+
+        const icon = L.divIcon({
+          html: `<div style="background:${filter.color};width:14px;height:14px;border-radius:50%;border:2px solid white;"></div>`,
+          iconSize:[14,14],
+          className:""
+        });
+
+        const marker = L.marker([d.gps.lat, d.gps.lng], {icon});
+
+        marker.bindPopup(`
+          <b>${filter.question}</b><br>
+          ${filter.value}<br>
+          Shop: ${d.shop_id}<br>
+          Date: ${d.date}<br><br>
+          <button onclick="openPhotoGallery('${d.shop_id}')">View Photos</button>
+        `);
+
+        clusterGroup.addLayer(marker);
+      }
+    });
+  });
+
+  if (heatMode && heatPoints.length > 0) {
+
+    heatLayer = L.heatLayer(heatPoints, {
+      radius:25,
+      blur:15,
+      maxZoom:17
+    }).addTo(map);
+  }
+}
+
+// ---------------- HEATMAP ----------------
+
+window.toggleHeatmap = () => {
+
+  heatMode = !heatMode;
+
+  if (heatMode) clusterGroup.clearLayers();
+
+  applyMultiFilter();
+
+  alert(heatMode ? "Heatmap ON" : "Heatmap OFF");
+};
+
+// ---------------- LEGEND ----------------
+
+function updateLegend() {
+
+  const box = document.getElementById("legendList");
+  box.innerHTML = "";
+
+  activeFilters.forEach(f => {
+
+    const row = document.createElement("div");
+
+    row.innerHTML = `
+      <div style="display:flex;align-items:center;margin-bottom:6px">
+        <div style="width:12px;height:12px;border-radius:50%;background:${f.color};margin-right:6px"></div>
+        <div style="flex:1">${f.question}<br><small>${f.value}</small></div>
+        <button onclick="toggleLayer(${f.id})">${f.visible?"ON":"OFF"}</button>
+        <button onclick="removeLayer(${f.id})">❌</button>
+      </div>
+    `;
+
+    box.appendChild(row);
+  });
+}
+
+window.toggleLayer = (id) => {
+
+  const layer = activeFilters.find(f => f.id === id);
+  if (!layer) return;
+
+  layer.visible = !layer.visible;
+
+  applyMultiFilter();
+  updateLegend();
+};
+
+window.removeLayer = (id) => {
+
+  activeFilters = activeFilters.filter(f => f.id !== id);
+
+  applyMultiFilter();
+  updateLegend();
+};
+
+// ---------------- PHOTO GALLERY ----------------
+
+window.openPhotoGallery = (shopId) => {
+
+  const rec = rawData.find(r => r.shop_id === shopId);
+
+  if (!rec || !rec.photos || rec.photos.length === 0) {
+    alert("No photos");
+    return;
+  }
+
+  currentPhotos = rec.photos;
+  currentIndex = 0;
+
+  photoViewer.src = currentPhotos[0];
+  photoModal.style.display = "flex";
+};
+
+window.nextPhoto = () => {
+
+  currentIndex = (currentIndex + 1) % currentPhotos.length;
+  photoViewer.src = currentPhotos[currentIndex];
+};
+
+window.prevPhoto = () => {
+
+  currentIndex = (currentIndex - 1 + currentPhotos.length) % currentPhotos.length;
+  photoViewer.src = currentPhotos[currentIndex];
+};
+
+window.closePhotoModal = () => {
+
+  photoModal.style.display = "none";
+};
+
+// ---------------- CLEAR ----------------
+
+window.clearMap = () => {
+
+  activeFilters = [];
+  colorIndex = 0;
+
+  activeFromDate = null;
+  activeToDate = null;
+  activeSurveyor = null;
+
+  fromDate.value = "";
+  toDate.value = "";
+  surveyorSelect.value = "";
+
+  selectedPolygon = null;
+  drawnItems.clearLayers();
+
+  clusterGroup.clearLayers();
+
+  if (heatLayer) {
+    map.removeLayer(heatLayer);
+    heatLayer = null;
+  }
+
+  heatMode = false;
+
+  legendList.innerHTML = "";
+};
+
+</script>
+
+</body>
+</html>

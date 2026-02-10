@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Survey Master Report</title>
+  <meta charset="UTF-8">
+
+  <style>
+    body { font-family: Arial; padding: 10px; }
+    table { border-collapse: collapse; width: 100%; font-size: 13px; }
+    th, td { border: 1px solid #ccc; padding: 6px; }
+    th { background: #f2f2f2; position: sticky; top: 0; }
+    button { padding: 8px 12px; margin-right: 10px; }
+  </style>
+</head>
+
+<body>
+
+<h2>Survey Full Report Dashboard</h2>
+
+<button id="refreshBtn" onclick="forceRefreshCache(db)">Refresh Data</button>
+
+
+<button onclick="loadData()">Load Full Report</button>
+<button onclick="exportExcel()">Export Excel</button>
+
+<button onclick="window.location.href='dashboard.html'">DASHBOARD</button>
+
+
+<br><br>
+
+<div style="overflow:auto; max-height:75vh;">
+<table id="reportTable">
+  <thead></thead>
+  <tbody></tbody>
+</table>
+</div>
+
+
+<!-- IMAGE MODAL -->
+<div id="imgModal" style="
+display:none;
+position:fixed;
+top:0;
+left:0;
+width:100%;
+height:100%;
+background:rgba(0,0,0,0.8);
+justify-content:center;
+align-items:center;
+z-index:9999;
+">
+
+  <span onclick="closeModal()" style="
+  position:absolute;
+  top:20px;
+  right:30px;
+  font-size:30px;
+  color:white;
+  cursor:pointer;
+  ">✖</span>
+
+  <img id="modalImage" style="
+  max-width:90%;
+  max-height:90%;
+  border:5px solid white;
+  border-radius:8px;
+  ">
+
+</div>
+
+
+
+
+
+<script type="module">
+
+// ================= HYBRID CACHE ENGINE =================
+const DAILY_REFRESH_KEY = "last_manual_refresh_date";
+
+const LAST_SYNC_KEY = "last_firestore_sync_time";
+
+const DB_NAME = "SurveyCacheDB";
+const STORE_NAME = "survey_data_store";
+
+const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+let memoryCache = null;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function checkDailyRefreshLock() {
+
+  const today = new Date().toISOString().slice(0,10);
+  const lastRefresh = localStorage.getItem(DAILY_REFRESH_KEY);
+
+  const btn = document.getElementById("refreshBtn");
+
+  if (!btn) return;
+
+  if (lastRefresh === today) {
+
+    btn.disabled = true;
+    btn.innerText = "Refreshed Today";
+
+    btn.style.background = "#ccc";
+    btn.style.cursor = "not-allowed";
+
+  }
+
+}
+
+
+
+
+
+
+
+
+// ---------- IndexedDB Init ----------
+
+
+
+
+
+
+function openCacheDB() {
+
+  return new Promise((resolve, reject) => {
+
+    const request = indexedDB.open(DB_NAME, 1);
+
+    request.onupgradeneeded = (event) => {
+
+      const db = event.target.result;
+
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME);
+      }
+
+    };
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject("IndexedDB open failed");
+
+  });
+
+}
+
+// ---------- Save Cache ----------
+
+
+
+async function saveMonthlyPartition(data) {
+
+  const db = await openCacheDB();
+  const tx = db.transaction(STORE_NAME, "readwrite");
+  const store = tx.objectStore(STORE_NAME);
+
+  const grouped = {};
+
+  data.forEach(item => {
+
+    if (!item.date) return;
+
+    const monthKey = item.date.substring(0, 7); // YYYY-MM
+
+    if (!grouped[monthKey]) grouped[monthKey] = [];
+
+    grouped[monthKey].push(item);
+
+  });
+
+  for (const month in grouped) {
+
+    const existingReq = store.get(month);
+
+    existingReq.onsuccess = () => {
+
+      const existing = existingReq.result || [];
+
+      store.put(grouped[month], month);
+
+
+    };
+
+  }
+
+}
+
+
+
+
+async function loadAllMonths() {
+
+  const db = await openCacheDB();
+  const tx = db.transaction(STORE_NAME, "readonly");
+  const store = tx.objectStore(STORE_NAME);
+
+  return new Promise(resolve => {
+
+    const all = [];
+    const cursor = store.openCursor();
+
+    cursor.onsuccess = e => {
+
+      const cur = e.target.result;
+
+      if (cur) {
+
+         {
+          all.push(...cur.value);
+        }
+
+        cur.continue();
+
+      } else {
+
+        resolve(all);
+
+      }
+    };
+
+  });
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ---------- Main Cached Loader ----------
+async function getSurveyDataHybrid(dbFirestore) {
+
+  // 1️⃣ MEMORY CACHE
+  if (memoryCache) {
+    console.log("Loaded from MEMORY");
+    return memoryCache;
+  }
+
+  // 2️⃣ LOAD INDEXEDDB CACHE (ALL MONTHS)
+  const cached = await loadAllMonths();
+
+  if (cached.length > 0) {
+
+    console.log("Loaded from INDEXEDDB");
+    memoryCache = cached;
+
+    // Background incremental sync (non blocking)
+  //  incrementalSync(dbFirestore);//
+
+    return cached;
+  }
+
+  // 3️⃣ FIRST TIME FULL FETCH
+  console.log("First time Firestore fetch");
+
+  const snapshot = await getDocs(collection(dbFirestore, "survey_data"));
+
+  let freshData = [];
+
+  snapshot.forEach(doc => freshData.push(doc.data()));
+
+  memoryCache = freshData;
+
+  await saveMonthlyPartition(freshData);
+
+  localStorage.setItem(LAST_SYNC_KEY, Date.now());
+
+  return freshData;
+}
+
+async function incrementalSync(dbFirestore) {
+
+  const lastSync = localStorage.getItem(LAST_SYNC_KEY);
+
+  if (!lastSync) return;
+
+  console.log("Incremental Sync Started");
+
+  const q = query(
+    collection(dbFirestore, "survey_data"),
+    where("created_at", ">", new Date(parseInt(lastSync)))
+  );
+
+  const snapshot = await getDocs(q);
+
+  if (snapshot.empty) {
+    console.log("No new records");
+    return;
+  }
+
+  let newData = [];
+
+  snapshot.forEach(doc => newData.push(doc.data()));
+
+  console.log("New records:", newData.length);
+
+  // Merge into memory
+  const existingIds = new Set(memoryCache.map(x => x.survey_id));
+
+const uniqueNew = newData.filter(x => !existingIds.has(x.survey_id));
+
+memoryCache = memoryCache.concat(uniqueNew);
+
+
+  // Save to month partitions
+  await saveMonthlyPartition(newData);
+
+  // Update sync time
+  localStorage.setItem(LAST_SYNC_KEY, Date.now());
+}
+
+
+
+
+
+
+// ---------- Manual Refresh ----------
+window.forceRefreshCache = async (dbFirestore) => {
+
+  const today = new Date().toISOString().slice(0,10);
+
+  const lastRefresh = localStorage.getItem(DAILY_REFRESH_KEY);
+
+  // Block multiple refresh per day
+  if (lastRefresh === today) {
+
+    alert("Data already refreshed today. Try again tomorrow.");
+    return;
+
+  }
+
+  const ok = confirm("This will reload ALL data from Firebase. Continue?");
+  if (!ok) return;
+
+  // 🔒 IMMEDIATELY LOCK BUTTON
+  const btn = document.getElementById("refreshBtn");
+  if (btn) {
+    btn.disabled = true;
+    btn.innerText = "Refreshing...";
+    btn.style.background = "#ccc";
+  }
+
+  console.log("Daily refresh started");
+
+  // Save refresh date
+  localStorage.setItem(DAILY_REFRESH_KEY, today);
+
+  // Clear cache
+  indexedDB.deleteDatabase(DB_NAME);
+  localStorage.removeItem(LAST_SYNC_KEY);
+
+  memoryCache = null;
+
+  location.reload();
+};
+
+
+
+
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+import { 
+  getFirestore, 
+  collection, 
+  getDocs,
+  query,
+  where 
+} from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+
+
+// ===== FIREBASE CONFIG =====
+const firebaseConfig = {
+  apiKey: "AIzaSyCZaG0u7xMETIJPSakZYLzLtdlpYJ8MRn4",
+  authDomain: "cgsurvey-sblr.firebaseapp.com",
+  projectId: "cgsurvey-sblr",
+  storageBucket: "cgsurvey-sblr.appspot.com"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+
+let tableData = [];
+let headers = [];
+let maxPhotoCount = 0;
+
+window.loadData = async () => {
+
+  tableData = [];
+  headers = [];
+  maxPhotoCount = 0;
+
+  const cachedData = await getSurveyDataHybrid(db);
+
+cachedData.forEach(d => {
+
+    
+    let row = {};
+
+    // ===== FIXED FIELDS =====
+    row["Shop ID"] = d.shop_id || "";
+    row["Surveyor ID"] = d.surveyor_id || "";
+    row["Date"] = d.date || "";
+    row["Latitude"] = d.gps?.lat || "";
+    row["Longitude"] = d.gps?.lng || "";
+
+    // ===== QUESTIONS (ACTUAL TEXT) =====
+    if (d.answers) {
+
+      Object.keys(d.answers).forEach(q => {
+
+        const questionText = d.answers[q].question || q;
+        const answerValue = d.answers[q].value || "";
+
+        row[questionText] = answerValue;
+
+      });
+
+    }
+
+    // ===== PHOTO COLUMNS =====
+    const photos = d.photos || [];
+
+    if (photos.length > maxPhotoCount) {
+      maxPhotoCount = photos.length;
+    }
+
+    photos.forEach((url, index) => {
+      row[`Photo ${index + 1}`] = url;
+    });
+
+    tableData.push(row);
+
+  });
+
+  buildTable();
+
+  alert("Loaded Records: " + tableData.length);
+
+};
+
+// ================= BUILD TABLE =================
+
+function buildTable() {
+
+  const thead = document.querySelector("#reportTable thead");
+  const tbody = document.querySelector("#reportTable tbody");
+
+  thead.innerHTML = "";
+  tbody.innerHTML = "";
+
+  // ===== COLLECT ALL HEADERS =====
+  tableData.forEach(row => {
+    Object.keys(row).forEach(key => {
+      if (!headers.includes(key)) headers.push(key);
+    });
+  });
+
+  // ===== ENSURE PHOTO HEADERS ORDERED =====
+  for (let i = 1; i <= maxPhotoCount; i++) {
+    const photoCol = `Photo ${i}`;
+    if (!headers.includes(photoCol)) headers.push(photoCol);
+  }
+
+  // ===== HEADER ROW =====
+  let headerRow = "<tr>";
+  headers.forEach(h => headerRow += `<th>${h}</th>`);
+  headerRow += "</tr>";
+
+  thead.innerHTML = headerRow;
+
+  // ===== DATA ROWS =====
+  tableData.forEach(row => {
+
+    let tr = "<tr>";
+
+    headers.forEach(h => {
+	  
+if (h.startsWith("Photo") && row[h]) {
+
+  tr += `
+    <td>
+      <img src="${row[h]}" 
+           onclick="openModal('${row[h]}')" 
+           style="
+           width:60px;
+           height:60px;
+           object-fit:cover;
+           cursor:pointer;
+           border-radius:6px;
+           border:1px solid #ccc;
+           ">
+    </td>
+  `;
+
+} else if (h === "Latitude" || h === "Longitude") {
+
+  tr += `
+    <td>
+      <a href="https://www.google.com/maps?q=${row["Latitude"]},${row["Longitude"]}" 
+         target="_blank"
+         style="color:blue;text-decoration:underline;">
+         ${row[h]}
+      </a>
+    </td>
+  `;
+
+} else {
+
+  tr += `<td>${row[h] || ""}</td>`;
+
+}
+	  
+	  
+	  
+    });
+
+    tr += "</tr>";
+
+    tbody.innerHTML += tr;
+
+  });
+
+}
+
+
+
+
+window.openModal = (imgUrl) => {
+
+  const modal = document.getElementById("imgModal");
+  const modalImg = document.getElementById("modalImage");
+
+  modal.style.display = "flex";
+  modalImg.src = imgUrl;
+
+};
+
+window.closeModal = () => {
+
+  document.getElementById("imgModal").style.display = "none";
+
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ================= EXCEL EXPORT =================
+
+window.exportExcel = () => {
+
+  if (tableData.length === 0) {
+    alert("Load report first");
+    return;
+  }
+
+  let csv = headers.join(",") + "\n";
+
+  tableData.forEach(row => {
+
+    let line = [];
+
+    headers.forEach(h => {
+      let value = row[h] || "";
+      value = value.toString().replace(/,/g, " ");
+      line.push(value);
+    });
+
+    csv += line.join(",") + "\n";
+
+  });
+
+  const blob = new Blob([csv], { type: "text/csv" });
+
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = "survey_full_report_photos_separate.csv";
+  link.click();
+
+};
+
+</script>
+
+</body>
+</html>

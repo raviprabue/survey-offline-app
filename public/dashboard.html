@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Survey Analytics Dashboard</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <style>
+    body {
+      font-family: Arial;
+      margin: 0;
+      background: #f5f6fa;
+    }
+
+    .header {
+      padding: 12px;
+      background: #2f3640;
+      color: white;
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .container {
+      padding: 15px;
+    }
+
+    .kpi-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 15px;
+    }
+
+    .kpi-card {
+      background: white;
+      padding: 15px;
+      border-radius: 8px;
+      box-shadow: 0 0 5px rgba(0,0,0,0.1);
+      text-align: center;
+    }
+
+    .kpi-title {
+      font-size: 13px;
+      color: gray;
+    }
+
+    .kpi-value {
+      font-size: 24px;
+      font-weight: bold;
+      margin-top: 5px;
+    }
+
+    .chart-row {
+      margin-top: 20px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+      gap: 20px;
+    }
+
+    .chart-box {
+      background: white;
+      padding: 15px;
+      border-radius: 8px;
+      box-shadow: 0 0 5px rgba(0,0,0,0.1);
+    }
+
+  </style>
+</head>
+
+<body>
+
+<div class="header">
+  <div>📊 Survey Dashboard</div>
+  <div>
+    <button onclick="window.location.href='index.html'">Table</button>
+    <button onclick="window.location.href='map.html'">Map</button>
+	<button id="refreshBtn" onclick="forceRefreshCache(db)">Refresh Data</button>
+
+
+  </div>
+</div>
+
+<div class="container">
+
+  <!-- KPI CARDS -->
+  <div class="kpi-row">
+
+    <div class="kpi-card">
+      <div class="kpi-title">Total Surveys</div>
+      <div class="kpi-value" id="totalSurveys">0</div>
+    </div>
+
+    <div class="kpi-card">
+      <div class="kpi-title">Today's Surveys</div>
+      <div class="kpi-value" id="todaySurveys">0</div>
+    </div>
+
+    <div class="kpi-card">
+      <div class="kpi-title">Active Surveyors</div>
+      <div class="kpi-value" id="activeSurveyors">0</div>
+    </div>
+
+    <div class="kpi-card">
+      <div class="kpi-title">Photos Uploaded</div>
+      <div class="kpi-value" id="totalPhotos">0</div>
+    </div>
+
+  </div>
+
+  <!-- CHARTS -->
+  <div class="chart-row">
+
+    <div class="chart-box">
+      <h4>Surveys By Date</h4>
+      <canvas id="dateChart"></canvas>
+    </div>
+
+    <div class="chart-box">
+      <h4>Surveyor Performance</h4>
+      <canvas id="surveyorChart"></canvas>
+    </div>
+
+  </div>
+
+</div>
+
+<script type="module">
+
+
+
+
+// ================= HYBRID CACHE ENGINE =================
+const LAST_SYNC_KEY = "last_firestore_sync_time";
+const DAILY_REFRESH_KEY = "last_manual_refresh_date";
+
+const DB_NAME = "SurveyCacheDB";
+const STORE_NAME = "survey_data_store";
+
+const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+let memoryCache = null;
+
+// ---------- IndexedDB Init ----------
+
+function openCacheDB() {
+
+  return new Promise((resolve, reject) => {
+
+    const request = indexedDB.open(DB_NAME, 1);
+
+    request.onupgradeneeded = (event) => {
+
+      const db = event.target.result;
+
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME);
+      }
+
+    };
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject("IndexedDB open failed");
+
+  });
+
+}
+
+// ---------- Save Cache ----------
+function checkDailyRefreshLock() {
+
+  const today = new Date().toISOString().slice(0,10);
+  const lastRefresh = localStorage.getItem(DAILY_REFRESH_KEY);
+
+  const btn = document.getElementById("refreshBtn");
+
+  if (!btn) return;
+
+  if (lastRefresh === today) {
+
+    btn.disabled = true;
+    btn.innerText = "Refreshed Today";
+
+    btn.style.background = "#ccc";
+    btn.style.cursor = "not-allowed";
+
+  }
+
+}
+
+// ---------- Load Cache ----------
+
+
+
+
+
+
+
+async function saveMonthlyPartition(data) {
+
+  const db = await openCacheDB();
+  const tx = db.transaction(STORE_NAME, "readwrite");
+  const store = tx.objectStore(STORE_NAME);
+
+  const grouped = {};
+
+  data.forEach(item => {
+
+    if (!item.date) return;
+
+    const monthKey = item.date.substring(0, 7); // YYYY-MM
+
+    if (!grouped[monthKey]) grouped[monthKey] = [];
+
+    grouped[monthKey].push(item);
+
+  });
+
+  for (const month in grouped) {
+
+    const existingReq = store.get(month);
+
+    existingReq.onsuccess = () => {
+
+      const existing = existingReq.result || [];
+
+      store.put(grouped[month], month);
+
+
+    };
+
+  }
+
+}
+
+
+
+
+async function loadAllMonths() {
+
+  const db = await openCacheDB();
+  const tx = db.transaction(STORE_NAME, "readonly");
+  const store = tx.objectStore(STORE_NAME);
+
+  return new Promise(resolve => {
+
+    const all = [];
+    const cursor = store.openCursor();
+
+    cursor.onsuccess = e => {
+
+      const cur = e.target.result;
+
+      if (cur) {
+
+         {
+          all.push(...cur.value);
+        }
+
+        cur.continue();
+
+      } else {
+
+        resolve(all);
+
+      }
+    };
+
+  });
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ---------- Main Cached Loader ----------
+async function getSurveyDataHybrid(dbFirestore) {
+
+  // 1️⃣ MEMORY CACHE
+  if (memoryCache) {
+    console.log("Loaded from MEMORY");
+    return memoryCache;
+  }
+
+  // 2️⃣ LOAD INDEXEDDB CACHE (ALL MONTHS)
+  const cached = await loadAllMonths();
+
+  if (cached.length > 0) {
+
+    console.log("Loaded from INDEXEDDB");
+    memoryCache = cached;
+
+    // Background incremental sync (non blocking)
+    //incrementalSync(dbFirestore);//
+
+    return cached;
+  }
+
+  // 3️⃣ FIRST TIME FULL FETCH
+  console.log("First time Firestore fetch");
+
+  const snapshot = await getDocs(collection(dbFirestore, "survey_data"));
+
+  let freshData = [];
+
+  snapshot.forEach(doc => freshData.push(doc.data()));
+
+  memoryCache = freshData;
+
+  await saveMonthlyPartition(freshData);
+
+  localStorage.setItem(LAST_SYNC_KEY, Date.now());
+
+  return freshData;
+}
+
+async function incrementalSync(dbFirestore) {
+
+  const lastSync = localStorage.getItem(LAST_SYNC_KEY);
+
+  if (!lastSync) return;
+
+  console.log("Incremental Sync Started");
+
+  const q = query(
+    collection(dbFirestore, "survey_data"),
+    where("created_at", ">", new Date(parseInt(lastSync)))
+  );
+
+  const snapshot = await getDocs(q);
+
+  if (snapshot.empty) {
+    console.log("No new records");
+    return;
+  }
+
+  let newData = [];
+
+  snapshot.forEach(doc => newData.push(doc.data()));
+
+  console.log("New records:", newData.length);
+
+  // Merge into memory
+  const existingIds = new Set(memoryCache.map(x => x.survey_id));
+
+const uniqueNew = newData.filter(x => !existingIds.has(x.survey_id));
+
+memoryCache = memoryCache.concat(uniqueNew);
+
+  // Save to month partitions
+  await saveMonthlyPartition(newData);
+
+  // Update sync time
+  localStorage.setItem(LAST_SYNC_KEY, Date.now());
+}
+
+
+
+
+
+// ---------- Manual Refresh ----------
+window.forceRefreshCache = async (dbFirestore) => {
+
+  const today = new Date().toISOString().slice(0,10);
+
+  const lastRefresh = localStorage.getItem(DAILY_REFRESH_KEY);
+
+  // Block multiple refresh per day
+  if (lastRefresh === today) {
+
+    alert("Data already refreshed today. Try again tomorrow.");
+    return;
+
+  }
+
+  const ok = confirm("This will reload ALL data from Firebase. Continue?");
+  if (!ok) return;
+
+  // 🔒 IMMEDIATELY LOCK BUTTON
+  const btn = document.getElementById("refreshBtn");
+  if (btn) {
+    btn.disabled = true;
+    btn.innerText = "Refreshing...";
+    btn.style.background = "#ccc";
+  }
+
+  console.log("Daily refresh started");
+
+  // Save refresh date
+  localStorage.setItem(DAILY_REFRESH_KEY, today);
+
+  // Clear cache
+  indexedDB.deleteDatabase(DB_NAME);
+  localStorage.removeItem(LAST_SYNC_KEY);
+
+  memoryCache = null;
+
+  location.reload();
+};
+
+
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+import { 
+  getFirestore, 
+  collection, 
+  getDocs,
+  query,
+  where 
+} from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+
+// Firebase Config
+const firebaseConfig = {
+  apiKey: "AIzaSyCZaG0u7xMETIJPSakZYLzLtdlpYJ8MRn4",
+  authDomain: "cgsurvey-sblr.firebaseapp.com",
+  projectId: "cgsurvey-sblr",
+  storageBucket: "cgsurvey-sblr.appspot.com"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+
+let rawData = [];
+
+// LOAD DATA
+async function loadDashboard() {
+
+  rawData = await getSurveyDataHybrid(db);
+
+  buildKPIs();
+  buildDateChart();
+  buildSurveyorChart();
+}
+
+loadDashboard();
+checkDailyRefreshLock();
+
+
+// ================= KPIs =================
+
+function buildKPIs() {
+
+  document.getElementById("totalSurveys").innerText = rawData.length;
+
+  const today = new Date().toISOString().slice(0,10);
+
+  const todayCount = rawData.filter(r => r.date === today).length;
+
+  document.getElementById("todaySurveys").innerText = todayCount;
+
+  const surveyorSet = new Set();
+
+  rawData.forEach(r => {
+    if (r.surveyor_id) surveyorSet.add(r.surveyor_id);
+  });
+
+  document.getElementById("activeSurveyors").innerText = surveyorSet.size;
+
+  let photoCount = 0;
+
+  rawData.forEach(r => {
+    if (r.photos) photoCount += r.photos.length;
+  });
+
+  document.getElementById("totalPhotos").innerText = photoCount;
+
+}
+
+// ================= DATE CHART =================
+
+function buildDateChart() {
+
+  const dateMap = {};
+
+  rawData.forEach(r => {
+
+    if (!r.date) return;
+
+    dateMap[r.date] = (dateMap[r.date] || 0) + 1;
+
+  });
+
+  const labels = Object.keys(dateMap);
+  const values = Object.values(dateMap);
+
+  new Chart(document.getElementById("dateChart"), {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{
+        label: "Surveys",
+        data: values,
+        fill: false,
+        tension: 0.2
+      }]
+    }
+  });
+
+}
+
+// ================= SURVEYOR CHART =================
+
+function buildSurveyorChart() {
+
+  const map = {};
+
+  rawData.forEach(r => {
+
+    if (!r.surveyor_id) return;
+
+    map[r.surveyor_id] = (map[r.surveyor_id] || 0) + 1;
+
+  });
+
+  const labels = Object.keys(map);
+  const values = Object.values(map);
+
+  new Chart(document.getElementById("surveyorChart"), {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [{
+        label: "Surveys",
+        data: values
+      }]
+    }
+  });
+
+}
+
+</script>
+
+</body>
+</html>
